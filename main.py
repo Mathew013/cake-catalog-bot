@@ -24,7 +24,10 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("Не найден BOT_TOKEN в файле .env")
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+# "or 0" спасает от пустой строки: в .env.example стоит "ADMIN_ID=" без значения
+ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
+if not ADMIN_ID:
+    logging.warning("ADMIN_ID не задан в .env: уведомления о заявках никуда не придут")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -314,7 +317,11 @@ async def show_card(callback: CallbackQuery, category_id: int, index: int):
 
 # ---------- ОБРАБОТЧИКИ ----------
 @dp.message(CommandStart())
-async def start(message: types.Message):
+async def start(message: types.Message, state: FSMContext):
+    # сбрасываем недооформленную заявку, иначе следующее сообщение запишется как имя/телефон
+    if await state.get_state() is not None:
+        await state.clear()
+        await message.answer("Оформление прервано.", reply_markup=ReplyKeyboardRemove())
     await send_main_menu(
         message,
         "Здравствуйте! Это витрина домашней кондитерской 🍰\n\nВыберите категорию:",
@@ -352,6 +359,7 @@ async def noop(callback: CallbackQuery):
 # ---------- ЗАЯВКА ----------
 CANCEL_TEXT = "❌ Отмена"
 SKIP_TEXT = "Без комментария"
+MAX_COMMENT = 500
 
 
 class Order(StatesGroup):
@@ -421,6 +429,9 @@ async def order_cancel(message: types.Message, state: FSMContext):
 @dp.message(Order.name, F.text)
 async def order_name(message: types.Message, state: FSMContext):
     name = message.text.strip()
+    if not name:
+        await message.answer("Напишите, пожалуйста, имя.")
+        return
     if len(name) > 50:
         await message.answer("Слишком длинное имя, напишите покороче.")
         return
@@ -465,6 +476,13 @@ async def order_phone_text(message: types.Message, state: FSMContext):
 @dp.message(Order.comment, F.text)
 async def order_comment(message: types.Message, state: FSMContext):
     comment = "" if message.text == SKIP_TEXT else message.text.strip()
+    # без ограничения длинный комментарий не влезет в уведомление админу (лимит Telegram 4096)
+    if len(comment) > MAX_COMMENT:
+        await message.answer(
+            f"Комментарий слишком длинный ({len(comment)} символов), "
+            f"сократите, пожалуйста, до {MAX_COMMENT}."
+        )
+        return
     data = await state.get_data()
     product = db_get_product(data["product_id"])
     if not product:
@@ -502,7 +520,7 @@ async def order_comment(message: types.Message, state: FSMContext):
                 f"Комментарий: {comment or '—'}",
             )
         except Exception:
-            pass
+            logging.exception("Не удалось уведомить админа о заявке №%s", order_id)
 
 
 # ---------- МОИ ЗАЯВКИ ----------
@@ -592,7 +610,7 @@ async def order_do_cancel(callback: CallbackQuery):
                 f"Телефон: {phone}",
             )
         except Exception:
-            pass
+            logging.exception("Не удалось уведомить админа об отмене заявки №%s", order_id)
 
     orders = db_get_user_orders(callback.from_user.id)
     await show_photo_screen(
@@ -990,7 +1008,8 @@ async def admin_order_cancel(callback: CallbackQuery):
             "Если есть вопросы, мы с вами свяжемся. Посмотреть каталог: /start",
         )
     except Exception:
-        pass  # клиент мог заблокировать бота
+        # чаще всего клиент просто заблокировал бота, но запишем причину в лог
+        logging.warning("Не удалось уведомить клиента %s об отмене заявки №%s", user_id, order_id)
     await show_admin_orders(callback, f"❌ Заявка №{order_id} отменена, клиент получил уведомление.\n\n")
     await callback.answer("Отменено")
 
@@ -1006,4 +1025,5 @@ async def main():
     await dp.start_polling(bot)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
